@@ -1,0 +1,23 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint
+        run: |
+          brew install shellcheck
+          shellcheck -S warning bin/clip-hist install.sh uninstall.sh tests/*.sh
+          zsh -n shell/clip-hist.zsh
+          bash -n install.sh uninstall.sh
+      - name: Build watcher
+        run: swiftc -O watcher/main.swift -o /tmp/clip-hist-watcher
+      - name: CLI tests (no clipboard/GUI)
+        run: |
+          tests/test_retention.sh
+          tests/test_list.sh
+          tests/test_pins.sh
+          tests/test_ignore.sh
+          tests/test_secrets_cli.sh
+          tests/test_settings.sh

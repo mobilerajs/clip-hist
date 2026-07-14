@@ -1,0 +1,432 @@
+#!/bin/bash
+set -euo pipefail
+
+DATA_DIR="${CLIPHIST_DATA_DIR:-$HOME/.local/share/clip-hist}"
+HISTORY_FILE="$DATA_DIR/history.jsonl"
+PINS_FILE="$DATA_DIR/pins.jsonl"
+CONFIG_FILE="$DATA_DIR/config.json"
+PAUSE_FILE="$DATA_DIR/paused"
+DEFAULT_RETENTION="8h"
+PY=/usr/bin/python3
+
+ensure_data_dir() { mkdir -p "$DATA_DIR"; chmod 700 "$DATA_DIR" 2>/dev/null || true; }
+
+usage() {
+  cat <<'EOF'
+clip-hist — macOS clipboard history
+
+Usage:
+  clip-hist list [-n N] [--json]   Show history, newest first
+  clip-hist get INDEX              Print raw text of item INDEX (from list)
+  clip-hist pin INDEX               Pin/unpin item INDEX (from list)
+  clip-hist retention [DURATION]   Show or set retention (e.g. 30m, 8h, 2d, off)
+  clip-hist key [BINDING]          Show or set picker keybinding (^K or ctrl-k)
+  clip-hist ignore [ID…|--inventory]  Show/toggle ignored source apps
+  clip-hist secrets [on|off]        Skip credential-shaped copies (default on)
+  clip-hist clear [--all] [--force]  Delete history (--all: pins too)
+  clip-hist pause | resume         Pause/resume recording
+  clip-hist status                 Watcher/paused state, retention, item count
+  clip-hist copy [--quiet] [TEXT]   Copy TEXT (or stdin) to the clipboard + notify
+EOF
+}
+
+duration_to_seconds() {
+  local d="$1"
+  if [[ "$d" == "off" ]]; then echo off; return 0; fi
+  if [[ "$d" =~ ^0+[mhd]$ ]]; then return 1; fi
+  if [[ "$d" =~ ^([0-9]+)([mhd])$ ]]; then
+    local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+    case "$u" in
+      m) echo $((n * 60)) ;;
+      h) echo $((n * 3600)) ;;
+      d) echo $((n * 86400)) ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+get_retention() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    $PY -c 'import json,sys; print(json.load(open(sys.argv[1])).get("retention","8h"))' \
+      "$CONFIG_FILE" 2>/dev/null || echo "$DEFAULT_RETENTION"
+  else
+    echo "$DEFAULT_RETENTION"
+  fi
+}
+
+retention_cutoff() {
+  local secs
+  secs=$(duration_to_seconds "$(get_retention)") || secs=$(duration_to_seconds "$DEFAULT_RETENTION")
+  if [[ "$secs" == "off" ]]; then
+    echo 0
+  else
+    echo $(( $(date +%s) - secs ))
+  fi
+}
+
+set_config() {
+  # set_config KEY VALUE — merge into config.json (never clobber other keys)
+  ensure_data_dir
+  $PY -c '
+import json, os, sys
+path, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {}
+try:
+    cfg = json.load(open(path))
+except Exception:
+    pass
+cfg[k] = v
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(cfg, f)
+os.replace(tmp, path)
+' "$CONFIG_FILE" "$1" "$2"
+}
+
+cmd_retention() {
+  if [[ $# -eq 0 ]]; then get_retention; return 0; fi
+  local d="$1"
+  if ! duration_to_seconds "$d" >/dev/null; then
+    echo "invalid duration: $d (use e.g. 30m, 8h, 2d, off)" >&2
+    exit 1
+  fi
+  set_config retention "$d"
+  echo "retention set to $d"
+}
+
+render() {
+  # render MODE N [INDEX] — MODE: json|human|feed|get
+  $PY - "$HISTORY_FILE" "$PINS_FILE" "$(retention_cutoff)" "$@" <<'PYEOF'
+import json, math, os, sys, time
+
+hist_path, pins_path, cutoff, mode = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+n = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+idx = int(sys.argv[6]) if len(sys.argv) > 6 else -1
+
+def load(path):
+    items = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                ts = o.get("ts")
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
+                    continue
+                if not isinstance(o.get("text"), str) or not o.get("text"):
+                    continue
+                items.append(o)
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeDecodeError):
+        sys.stderr.write("clip-hist: warning: could not fully read %s\n" % path)
+    return items
+
+pins = load(pins_path)
+pins.reverse()
+for o in pins:
+    o["pinned"] = True
+pin_texts = {p["text"] for p in pins}
+hist = [o for o in load(hist_path) if float(o["ts"]) >= cutoff and o["text"] not in pin_texts]
+hist.reverse()
+items = pins + hist
+
+if mode == "get":
+    if 0 <= idx < len(items):
+        sys.stdout.write(items[idx]["text"])
+        sys.exit(0)
+    sys.exit(1)
+
+if mode == "pintoggle":
+    if not (0 <= idx < len(items)):
+        sys.exit(1)
+    target = items[idx]
+    orig = load(pins_path)
+    if any(p["text"] == target["text"] for p in orig):
+        new = [p for p in orig if p["text"] != target["text"]]
+        msg = "unpinned"
+    else:
+        if len(orig) >= 100:
+            print("pin limit reached (100)")
+            sys.exit(1)
+        new = orig + [{"ts": target["ts"], "app": target.get("app", "?"), "text": target["text"]}]
+        msg = "pinned"
+    tmp = pins_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for p in new:
+            f.write(json.dumps(p) + "\n")
+    os.replace(tmp, pins_path)
+    print(msg)
+    sys.exit(0)
+
+if n > 0:
+    items = items[:n]
+
+def rel(ts):
+    d = int(time.time() - ts)
+    if d < 60: return "%ds" % d
+    if d < 3600: return "%dm" % (d // 60)
+    if d < 86400: return "%dh" % (d // 3600)
+    return "%dd" % (d // 86400)
+
+for i, o in enumerate(items):
+    if mode == "json":
+        print(json.dumps(o))
+        continue
+    flat = o["text"].replace("\t", " ").replace("\r", "").replace("\n", "⏎")
+    app = str(o.get("app", "?")).split(".")[-1]
+    mark = "*" if o.get("pinned") else " "
+    if mode == "feed":
+        print("%d\t%s%4s %-12s %s" % (i, mark, rel(float(o["ts"])), app[:12], flat))
+    else:
+        if len(flat) > 100:
+            flat = flat[:100] + "…"
+        print("%3d %s%4s  %-16s %s" % (i, mark, rel(float(o["ts"])), app[:16], flat))
+PYEOF
+}
+
+cmd_list() {
+  local n=0 mode=human
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      -n)
+        n="${2:-}"
+        if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+          echo "invalid -n value: ${n:-missing} (expected a number)" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+  done
+  render "$mode" "$n"
+}
+
+cmd_clear() {
+  local force=0 all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --all) all=1; shift ;;
+      *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+  done
+  if [[ "$force" -ne 1 ]]; then
+    printf 'Delete all clipboard history? [y/N] '
+    read -r ans || ans=n
+    if [[ "$ans" != "y" && "$ans" != "Y" ]]; then echo "aborted"; exit 1; fi
+  fi
+  if [[ -f "$HISTORY_FILE" ]]; then : > "$HISTORY_FILE"; fi
+  if [[ "$all" -eq 1 ]]; then
+    if [[ -f "$PINS_FILE" ]]; then : > "$PINS_FILE"; fi
+    echo "history and pins cleared"
+  else
+    echo "history cleared"
+  fi
+}
+
+cmd_status() {
+  if pgrep -qf clip-hist-watcher; then
+    echo "watcher: running"
+  else
+    echo "watcher: NOT running"
+  fi
+  if [[ -f "$PAUSE_FILE" ]]; then echo "recording: paused"; else echo "recording: active"; fi
+  echo "retention: $(get_retention)"
+  local count
+  count=$(render json 0 | grep -vc '"pinned": true' || true)
+  echo "items (within retention): $count"
+  local pcount
+  pcount=$(grep -c . "$PINS_FILE" 2>/dev/null || true)
+  echo "pins: ${pcount:-0}"
+  if [[ -f "$HISTORY_FILE" ]]; then
+    echo "file: $HISTORY_FILE ($(du -h "$HISTORY_FILE" | cut -f1 | tr -d ' '))"
+  else
+    echo "file: (none yet)"
+  fi
+}
+
+cmd_key() {
+  if [[ $# -eq 0 ]]; then
+    if [[ -f "$CONFIG_FILE" ]]; then
+      $PY -c 'import json,sys; print(json.load(open(sys.argv[1])).get("key","^H"))' \
+        "$CONFIG_FILE" 2>/dev/null || echo "^H"
+    else
+      echo "^H"
+    fi
+    return 0
+  fi
+  local k="$1"
+  if [[ "$k" =~ ^[Cc][Tt][Rr][Ll][-+]([A-Za-z])$ ]]; then
+    k="^$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')"
+  fi
+  if ! [[ "$k" =~ ^\^[A-Z]$ ]]; then
+    echo "invalid key: $1 (use e.g. ^K or ctrl-k)" >&2
+    exit 1
+  fi
+  set_config key "$k"
+  echo "picker key set to $k — takes effect in new shells (or run: exec zsh)"
+}
+
+cmd_ignore() {
+  ensure_data_dir
+  if [[ $# -eq 0 ]]; then
+    $PY -c '
+import json, sys
+try:
+    arr = json.load(open(sys.argv[1])).get("ignored_apps", [])
+except Exception:
+    arr = []
+print("\n".join(arr) if arr else "(none)")' "$CONFIG_FILE"
+    return 0
+  fi
+  if [[ "$1" == "--inventory" ]]; then
+    $PY - "$HISTORY_FILE" "$PINS_FILE" "$CONFIG_FILE" <<'PYEOF'
+import glob, json, os, re, subprocess, sys
+
+hist, pins, cfg_path = sys.argv[1], sys.argv[2], sys.argv[3]
+seen = set()
+for path in (hist, pins):
+    try:
+        for line in open(path):
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(o, dict) and o.get("app"):
+                seen.add(str(o["app"]))
+    except FileNotFoundError:
+        pass
+
+paths = (glob.glob("/Applications/*.app")
+         + glob.glob("/System/Applications/*.app")
+         + glob.glob(os.path.expanduser("~/Applications/*.app")))
+installed = set()
+if paths:
+    try:
+        out = subprocess.run(["mdls", "-name", "kMDItemCFBundleIdentifier"] + paths,
+                             capture_output=True, text=True, timeout=30).stdout
+        installed = set(re.findall(r'= "([^"]+)"', out))
+    except Exception:
+        pass
+
+ignored = set()
+try:
+    ignored = set(json.load(open(cfg_path)).get("ignored_apps", []))
+except Exception:
+    pass
+
+for a in sorted(seen | installed | ignored, key=str.lower):
+    print("[%s] %s" % ("x" if a in ignored else " ", a))
+PYEOF
+    return 0
+  fi
+  $PY -c '
+import json, os, sys
+path = sys.argv[1]
+cfg = {}
+try:
+    cfg = json.load(open(path))
+except Exception:
+    pass
+arr = set(cfg.get("ignored_apps", []))
+for a in sys.argv[2:]:
+    if a in arr:
+        arr.discard(a)
+        print("unignored: " + a)
+    else:
+        arr.add(a)
+        print("ignored: " + a)
+cfg["ignored_apps"] = sorted(arr)
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(cfg, f)
+os.replace(tmp, path)
+' "$CONFIG_FILE" "$@"
+}
+
+cmd_secrets() {
+  if [[ $# -eq 0 ]]; then
+    $PY -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("skip_secrets", "on")
+except Exception:
+    v = "on"
+print(v)' "$CONFIG_FILE"
+    return 0
+  fi
+  case "$1" in
+    on|off) set_config skip_secrets "$1"; echo "secret detection $1" ;;
+    *) echo "usage: clip-hist secrets [on|off]" >&2; exit 1 ;;
+  esac
+}
+
+cmd_copy() {
+  # Sanctioned agent write path: copy TEXT (or stdin) to the clipboard.
+  local quiet=0 content snippet
+  if [[ "${1:-}" == "--quiet" ]]; then quiet=1; shift; fi
+  if [[ $# -gt 0 ]]; then
+    content="$*"
+  else
+    # sentinel trick: command substitution strips trailing newlines; keep them
+    content=$(cat; printf x)
+    content=${content%x}
+  fi
+  printf '%s' "$content" | pbcopy
+  if [[ $quiet -eq 0 ]]; then
+    # char-safe truncation + sanitization in python; never let this fail the copy
+    snippet=$($PY -c '
+import sys
+s = sys.argv[1][:50]
+s = s.replace("\"", "").replace("\\", "").replace("\n", " ").replace("\r", " ")
+print(s)' "$content" 2>/dev/null || true)
+    osascript -e "display notification \"$snippet\" with title \"clip-hist\" subtitle \"copied to clipboard\"" >/dev/null 2>&1 || true
+  fi
+  echo "copied to clipboard"
+}
+
+cmd="${1:-}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$cmd" in
+  retention) cmd_retention "$@" ;;
+  list) cmd_list "$@" ;;
+  get)
+    if [[ $# -ne 1 ]]; then usage >&2; exit 1; fi
+    if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+      echo "invalid index: $1 (expected a number)" >&2
+      exit 1
+    fi
+    render get 0 "$1"
+    ;;
+  pick-feed) render feed 0 ;;
+  pin)
+    if [[ $# -ne 1 ]]; then usage >&2; exit 1; fi
+    if ! [[ "$1" =~ ^[0-9]+$ ]]; then echo "invalid index: $1 (expected a number)" >&2; exit 1; fi
+    ensure_data_dir
+    render pintoggle 0 "$1"
+    ;;
+  clear) cmd_clear "$@" ;;
+  pause) ensure_data_dir; touch "$PAUSE_FILE"; echo "recording paused" ;;
+  resume) rm -f "$PAUSE_FILE"; echo "recording resumed" ;;
+  status) cmd_status ;;
+  key) cmd_key "$@" ;;
+  ignore) cmd_ignore "$@" ;;
+  secrets) cmd_secrets "$@" ;;
+  copy) cmd_copy "$@" ;;
+  ""|help|-h|--help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 1 ;;
+esac
